@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 import psycopg2
 from dotenv import load_dotenv
@@ -10,6 +11,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI()
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://synthsurvey.com",
+        "https://synthsurvey.com",
+        "http://www.synthsurvey.com",
+        "https://www.synthsurvey.com",
+        "http://localhost:3000",  # For local development
+        "http://localhost:5000"   # For local development
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    expose_headers=["*"]
+)
 
 # Database connection parameters
 DB_PARAMS = {
