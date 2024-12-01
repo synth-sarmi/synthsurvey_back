@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel, EmailStr
+import random
 
 # Load environment variables
 load_dotenv()
@@ -84,6 +85,10 @@ class Survey(BaseModel):
     questions: List[int]
     token_cost: int
 
+class SurveyQuestionUpdate(BaseModel):
+    question_id: int
+    order_number: int
+
 # Token Management Endpoints
 @app.post("/tokens/purchase")
 async def purchase_tokens(
@@ -124,14 +129,35 @@ async def create_audience(
 ):
     try:
         cur = db.cursor()
+        
+        # Start transaction
+        cur.execute("BEGIN")
+        
+        # Create the audience
         cur.execute("""
             INSERT INTO audiences (user_id, name, description, size, demographics)
             VALUES ((SELECT id FROM users WHERE auth0_id = %s), %s, %s, %s, %s)
             RETURNING id
         """, (user['sub'], audience.name, audience.description, audience.size, audience.demographics))
+        
+        audience_id = cur.fetchone()['id']
+        
+        # Sample people from ipumps table based on demographics
+        cur.execute("""
+            WITH sampled_people AS (
+                SELECT id, demographics
+                FROM ipumps
+                WHERE demographics @> %s
+                ORDER BY RANDOM()
+                LIMIT %s
+            )
+            INSERT INTO audience_members (audience_id, user_id, ipump_id, demographics)
+            SELECT %s, (SELECT id FROM users WHERE auth0_id = %s), id, demographics
+            FROM sampled_people
+        """, (audience.demographics, audience.size, audience_id, user['sub']))
+        
         db.commit()
-        result = cur.fetchone()
-        return {"id": result['id']}
+        return {"id": audience_id}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -143,9 +169,27 @@ async def list_audiences(
 ):
     cur = db.cursor()
     cur.execute("""
-        SELECT * FROM audiences 
-        WHERE user_id = (SELECT id FROM users WHERE auth0_id = %s)
+        SELECT a.*, COUNT(am.id) as current_size 
+        FROM audiences a
+        LEFT JOIN audience_members am ON a.id = am.audience_id
+        WHERE a.user_id = (SELECT id FROM users WHERE auth0_id = %s)
+        GROUP BY a.id
     """, (user['sub'],))
+    return cur.fetchall()
+
+@app.get("/audiences/{audience_id}/members")
+async def get_audience_members(
+    audience_id: int,
+    db = Depends(get_db),
+    user = Depends(validate_token)
+):
+    cur = db.cursor()
+    cur.execute("""
+        SELECT am.* 
+        FROM audience_members am
+        WHERE am.audience_id = %s 
+        AND am.user_id = (SELECT id FROM users WHERE auth0_id = %s)
+    """, (audience_id, user['sub']))
     return cur.fetchall()
 
 # Question Management Endpoints
@@ -231,13 +275,82 @@ async def list_surveys(
 ):
     cur = db.cursor()
     cur.execute("""
-        SELECT s.*, array_agg(sq.question_id) as question_ids
+        SELECT s.*, array_agg(sq.question_id ORDER BY sq.order_number) as question_ids
         FROM surveys s
         LEFT JOIN survey_questions sq ON s.id = sq.survey_id
         WHERE s.user_id = (SELECT id FROM users WHERE auth0_id = %s)
         GROUP BY s.id
     """, (user['sub'],))
     return cur.fetchall()
+
+# New endpoints for managing survey questions
+@app.post("/surveys/{survey_id}/questions")
+async def add_question_to_survey(
+    survey_id: int,
+    question: SurveyQuestionUpdate,
+    db = Depends(get_db),
+    user = Depends(validate_token)
+):
+    try:
+        cur = db.cursor()
+        
+        # Verify survey ownership and draft status
+        cur.execute("""
+            SELECT status FROM surveys 
+            WHERE id = %s 
+            AND user_id = (SELECT id FROM users WHERE auth0_id = %s)
+            AND status = 'draft'
+        """, (survey_id, user['sub']))
+        
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Survey not found or not in draft status")
+        
+        # Add question to survey
+        cur.execute("""
+            INSERT INTO survey_questions (survey_id, question_id, order_number)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (survey_id, question_id) 
+            DO UPDATE SET order_number = EXCLUDED.order_number
+        """, (survey_id, question.question_id, question.order_number))
+        
+        db.commit()
+        return {"success": True}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/surveys/{survey_id}/questions/{question_id}")
+async def remove_question_from_survey(
+    survey_id: int,
+    question_id: int,
+    db = Depends(get_db),
+    user = Depends(validate_token)
+):
+    try:
+        cur = db.cursor()
+        
+        # Verify survey ownership and draft status
+        cur.execute("""
+            SELECT status FROM surveys 
+            WHERE id = %s 
+            AND user_id = (SELECT id FROM users WHERE auth0_id = %s)
+            AND status = 'draft'
+        """, (survey_id, user['sub']))
+        
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Survey not found or not in draft status")
+        
+        # Remove question from survey
+        cur.execute("""
+            DELETE FROM survey_questions 
+            WHERE survey_id = %s AND question_id = %s
+        """, (survey_id, question_id))
+        
+        db.commit()
+        return {"success": True}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Results Management Endpoints
 @app.get("/surveys/{survey_id}/results")

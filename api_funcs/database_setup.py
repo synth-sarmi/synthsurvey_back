@@ -39,6 +39,17 @@ CREATE TABLE audiences (
     CONSTRAINT positive_size CHECK (size > 0)
 );
 
+-- Audience members table to store actual sampled people
+CREATE TABLE audience_members (
+    id SERIAL PRIMARY KEY,
+    audience_id INTEGER REFERENCES audiences(id) ON DELETE CASCADE,
+    user_id INTEGER REFERENCES users(id),
+    ipump_id INTEGER NOT NULL, -- Reference to the person in ipumps table
+    demographics JSONB, -- Store the actual demographics of the sampled person
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(audience_id, ipump_id) -- Prevent duplicate sampling in same audience
+);
+
 -- Questions table to store survey questions
 CREATE TABLE questions (
     id SERIAL PRIMARY KEY,
@@ -68,9 +79,10 @@ CREATE TABLE surveys (
 
 -- Survey questions junction table
 CREATE TABLE survey_questions (
-    survey_id INTEGER REFERENCES surveys(id),
-    question_id INTEGER REFERENCES questions(id),
+    survey_id INTEGER REFERENCES surveys(id) ON DELETE CASCADE,
+    question_id INTEGER REFERENCES questions(id) ON DELETE CASCADE,
     order_number INTEGER NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (survey_id, question_id)
 );
 
@@ -88,6 +100,8 @@ CREATE TABLE results (
 CREATE INDEX idx_users_auth0_id ON users(auth0_id);
 CREATE INDEX idx_tokens_user_id ON tokens(user_id);
 CREATE INDEX idx_audiences_user_id ON audiences(user_id);
+CREATE INDEX idx_audience_members_audience_id ON audience_members(audience_id);
+CREATE INDEX idx_audience_members_user_id ON audience_members(user_id);
 CREATE INDEX idx_questions_user_id ON questions(user_id);
 CREATE INDEX idx_surveys_user_id ON surveys(user_id);
 CREATE INDEX idx_results_survey_id ON results(survey_id);
