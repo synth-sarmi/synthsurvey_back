@@ -6,12 +6,15 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 import jwt
 import httpx
 from functools import lru_cache
 from dotenv import load_dotenv
 import random
+import requests
+from jwt.exceptions import PyJWTError, ExpiredSignatureError, InvalidTokenError
+import json
 
 # Load environment variables
 load_dotenv()
@@ -20,6 +23,11 @@ app = FastAPI(title="SynthSurvey API")
 
 # Security
 security = HTTPBearer()
+
+# Models
+class TokenPayload(BaseModel):
+    sub: str
+    exp: int
 
 # Configure CORS
 app.add_middleware(
@@ -47,7 +55,6 @@ DB_PARAMS = {
     "password": os.getenv("DB_PASSWORD")
 }
 
-# Models
 class WaitlistEntry(BaseModel):
     email: EmailStr
 
@@ -78,39 +85,74 @@ class SurveyQuestionUpdate(BaseModel):
     question_id: int
     order_number: int
 
-# Utility Functions
-@lru_cache()
-async def get_auth0_public_key():
-    """Fetch and cache Auth0 public key for token validation"""
-    try:
-        auth0_domain = os.getenv('AUTH0_DOMAIN')
-        url = f'https://{auth0_domain}/.well-known/jwks.json'
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-            return response.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch Auth0 public key: {str(e)}")
+# Auth0 Configuration
+AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "dev-16iksas57tijkr38.us.auth0.com")
+AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "api.synthsurvey.com/")
 
-async def validate_auth0_token(token: str) -> Dict:
-    """
-    Validate Auth0 JWT token and return payload
-    In production, implement full JWT validation using Auth0's JWKS
-    """
+def verify_token(token: str = Depends(security)) -> Dict:
     try:
-        # Decode token without verification for development
-        # In production, implement proper verification using Auth0's public key
-        payload = jwt.decode(
-            token,
-            options={"verify_signature": False}
-        )
+        jwks_url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
         
-        if 'sub' not in payload:
-            raise HTTPException(status_code=401, detail="Invalid token payload")
-            
-        return payload
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+        # Fetch JWKS
+        response = requests.get(jwks_url)
+        response.raise_for_status()
+        jwks = response.json()
 
+        # Decode header to get key ID
+        unverified_header = jwt.get_unverified_header(token.credentials)
+        rsa_key = next(
+            (key for key in jwks["keys"] if key["kid"] == unverified_header["kid"]),
+            None
+        )
+
+        if not rsa_key:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authentication credentials"
+            )
+
+        # Construct the public key
+        public_key = {
+            "kty": rsa_key["kty"],
+            "kid": rsa_key["kid"],
+            "use": rsa_key["use"],
+            "n": rsa_key["n"],
+            "e": rsa_key["e"]
+        }
+
+        # Verify and decode the token
+        payload = jwt.decode(
+            token.credentials,
+            key=jwt.algorithms.RSAAlgorithm.from_jwk(public_key),
+            algorithms=["RS256"],
+            audience=AUTH0_AUDIENCE,
+            issuer=f"https://{AUTH0_DOMAIN}/"
+        )
+
+        return payload
+
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail="Token has expired"
+        )
+    except InvalidTokenError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid claims. Please check the audience and issuer"
+        )
+    except PyJWTError:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authentication credentials"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Unable to parse authentication token: {str(e)}"
+        )
+
+# Utility Functions
 def check_user_tokens(db_cursor, auth0_id: str, required_tokens: int) -> bool:
     """Check if user has sufficient tokens"""
     db_cursor.execute("""
@@ -216,14 +258,6 @@ def get_db():
     finally:
         conn.close()
 
-# Auth0 validation
-async def validate_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    try:
-        token = credentials.credentials
-        return await validate_auth0_token(token)
-    except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
-
 # Initialize database tables
 def init_db():
     conn = psycopg2.connect(**DB_PARAMS)
@@ -283,7 +317,7 @@ async def add_to_waitlist(entry: WaitlistEntry):
 async def purchase_tokens(
     purchase: TokenPurchase,
     db = Depends(get_db),
-    user = Depends(validate_token)
+    user = Depends(verify_token)
 ):
     try:
         cur = db.cursor()
@@ -309,93 +343,39 @@ async def purchase_tokens(
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/audiences")
+async def list_audiences(
+    db = Depends(get_db),
+    user = Depends(verify_token)
+):
+    cur = db.cursor()
+    cur.execute("""
+        SELECT * 
+        FROM audiences
+        WHERE user_id = (SELECT id FROM users WHERE auth0_id = %s)
+    """, (user['sub'],))
+    return cur.fetchall()
+
 # Audience Management Endpoints
 @app.post("/audiences")
 async def create_audience(
     audience: Audience,
     db = Depends(get_db),
-    user = Depends(validate_token)
+    user = Depends(verify_token)
 ):
     try:
         cur = db.cursor()
         
-        # Start transaction
-        cur.execute("BEGIN")
+        # Convert demographics dict to JSON string
+        demographics_json = json.dumps(audience.demographics)
         
-        # Create the audience
+        # Create the audience configuration
         cur.execute("""
             INSERT INTO audiences (user_id, name, description, size, demographics)
             VALUES ((SELECT id FROM users WHERE auth0_id = %s), %s, %s, %s, %s)
             RETURNING id
-        """, (user['sub'], audience.name, audience.description, audience.size, audience.demographics))
+        """, (user['sub'], audience.name, audience.description, audience.size, demographics_json))
         
-        audience_id = cur.fetchone()['id']
-        
-        # Sample people from ipumps table based on demographics
-        cur.execute("""
-            WITH sampled_people AS (
-                SELECT id, demographics
-                FROM ipumps
-                WHERE demographics @> %s
-                ORDER BY RANDOM()
-                LIMIT %s
-            )
-            INSERT INTO audience_members (audience_id, user_id, ipump_id, demographics)
-            SELECT %s, (SELECT id FROM users WHERE auth0_id = %s), id, demographics
-            FROM sampled_people
-        """, (audience.demographics, audience.size, audience_id, user['sub']))
-        
-        db.commit()
-        return {"id": audience_id}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/audiences")
-async def list_audiences(
-    db = Depends(get_db),
-    user = Depends(validate_token)
-):
-    cur = db.cursor()
-    cur.execute("""
-        SELECT a.*, COUNT(am.id) as current_size 
-        FROM audiences a
-        LEFT JOIN audience_members am ON a.id = am.audience_id
-        WHERE a.user_id = (SELECT id FROM users WHERE auth0_id = %s)
-        GROUP BY a.id
-    """, (user['sub'],))
-    return cur.fetchall()
-
-@app.get("/audiences/{audience_id}/members")
-async def get_audience_members(
-    audience_id: int,
-    db = Depends(get_db),
-    user = Depends(validate_token)
-):
-    cur = db.cursor()
-    cur.execute("""
-        SELECT am.* 
-        FROM audience_members am
-        WHERE am.audience_id = %s 
-        AND am.user_id = (SELECT id FROM users WHERE auth0_id = %s)
-    """, (audience_id, user['sub']))
-    return cur.fetchall()
-
-# Question Management Endpoints
-@app.post("/questions")
-async def create_question(
-    question: Question,
-    db = Depends(get_db),
-    user = Depends(validate_token)
-):
-    try:
-        cur = db.cursor()
-        cur.execute("""
-            INSERT INTO questions (user_id, title, description, question_type, options)
-            VALUES ((SELECT id FROM users WHERE auth0_id = %s), %s, %s, %s, %s)
-            RETURNING id
-        """, (user['sub'], question.title, question.description, 
-              question.question_type, question.options))
         db.commit()
         result = cur.fetchone()
         return {"id": result['id']}
@@ -406,7 +386,7 @@ async def create_question(
 @app.get("/questions")
 async def list_questions(
     db = Depends(get_db),
-    user = Depends(validate_token)
+    user = Depends(verify_token)
 ):
     cur = db.cursor()
     cur.execute("""
@@ -420,7 +400,7 @@ async def list_questions(
 async def create_survey(
     survey: Survey,
     db = Depends(get_db),
-    user = Depends(validate_token)
+    user = Depends(verify_token)
 ):
     try:
         cur = db.cursor()
@@ -460,7 +440,7 @@ async def create_survey(
 @app.get("/surveys")
 async def list_surveys(
     db = Depends(get_db),
-    user = Depends(validate_token)
+    user = Depends(verify_token)
 ):
     cur = db.cursor()
     cur.execute("""
@@ -478,7 +458,7 @@ async def add_question_to_survey(
     survey_id: int,
     question: SurveyQuestionUpdate,
     db = Depends(get_db),
-    user = Depends(validate_token)
+    user = Depends(verify_token)
 ):
     try:
         cur = db.cursor()
@@ -513,7 +493,7 @@ async def remove_question_from_survey(
     survey_id: int,
     question_id: int,
     db = Depends(get_db),
-    user = Depends(validate_token)
+    user = Depends(verify_token)
 ):
     try:
         cur = db.cursor()
@@ -546,7 +526,7 @@ async def remove_question_from_survey(
 async def get_survey_results(
     survey_id: int,
     db = Depends(get_db),
-    user = Depends(validate_token)
+    user = Depends(verify_token)
 ):
     cur = db.cursor()
     # Verify survey ownership
@@ -570,3 +550,4 @@ async def get_survey_results(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
