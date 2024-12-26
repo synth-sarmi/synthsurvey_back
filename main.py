@@ -12,9 +12,7 @@ import bcrypt
 from uuid import uuid4
 from dotenv import load_dotenv
 import random
-import requests
-from jwt.exceptions import PyJWTError, ExpiredSignatureError, InvalidTokenError
-import json
+from functools import lru_cache
 
 # Load environment variables
 load_dotenv()
@@ -29,10 +27,14 @@ app = FastAPI(title="SynthSurvey API")
 # Security
 security = HTTPBearer()
 
-# Models
-class TokenPayload(BaseModel):
-    sub: str
-    exp: int
+# Auth Models
+class UserSignup(BaseModel):
+    email: EmailStr
+    password: constr(min_length=8)
+    
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
 
 # Configure CORS
 app.add_middleware(
@@ -93,136 +95,6 @@ class SurveyQuestionUpdate(BaseModel):
     question_id: int
     order_number: int
 
-# Utility Functions
-@lru_cache()
-async def get_auth0_public_key():
-    """Fetch and cache Auth0 public key for token validation"""
-    try:
-        auth0_domain = os.getenv('AUTH0_DOMAIN')
-        url = f'https://{auth0_domain}/.well-known/jwks.json'
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url)
-            return response.json()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch Auth0 public key: {str(e)}")
-
-async def validate_auth0_token(token: str) -> Dict:
-    """
-    Validate Auth0 JWT token and return payload
-    In production, implement full JWT validation using Auth0's JWKS
-    """
-    try:
-        # Decode token without verification for development
-        # In production, implement proper verification using Auth0's public key
-        payload = jwt.decode(
-            token,
-            options={"verify_signature": False}
-        )
-        
-        if 'sub' not in payload:
-            raise HTTPException(status_code=401, detail="Invalid token payload")
-            
-        return payload
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
-
-def check_user_tokens(db_cursor, auth0_id: str, required_tokens: int) -> bool:
-    """Check if user has sufficient tokens"""
-    db_cursor.execute("""
-        SELECT tokens_remaining 
-        FROM users 
-        WHERE auth0_id = %s
-    """, (auth0_id,))
-    
-    result = db_cursor.fetchone()
-    if not result:
-        raise HTTPException(status_code=404, detail="User not found")
-        
-    return result['tokens_remaining'] >= required_tokens
-
-def deduct_user_tokens(db_cursor, auth0_id: str, amount: int) -> int:
-    """Deduct tokens from user's balance and return new balance"""
-    db_cursor.execute("""
-        UPDATE users 
-        SET tokens_remaining = tokens_remaining - %s
-        WHERE auth0_id = %s AND tokens_remaining >= %s
-        RETURNING tokens_remaining
-    """, (amount, auth0_id, amount))
-    
-    result = db_cursor.fetchone()
-    if not result:
-        raise HTTPException(status_code=400, detail="Insufficient tokens")
-        
-    return result['tokens_remaining']
-
-def record_token_transaction(db_cursor, auth0_id: str, amount: int, 
-                           transaction_type: str, description: Optional[str] = None):
-    """Record a token transaction"""
-    db_cursor.execute("""
-        INSERT INTO tokens (user_id, amount, transaction_type, description)
-        VALUES (
-            (SELECT id FROM users WHERE auth0_id = %s),
-            %s,
-            %s,
-            %s
-        )
-    """, (auth0_id, amount, transaction_type, description))
-
-def get_survey_with_questions(db_cursor, survey_id: int, auth0_id: str):
-    """Get survey details with its questions"""
-    db_cursor.execute("""
-        SELECT s.*, 
-               array_agg(json_build_object(
-                   'id', q.id,
-                   'title', q.title,
-                   'question_type', q.question_type,
-                   'options', q.options,
-                   'order_number', sq.order_number
-               ) ORDER BY sq.order_number) as questions
-        FROM surveys s
-        LEFT JOIN survey_questions sq ON s.id = sq.survey_id
-        LEFT JOIN questions q ON sq.question_id = q.id
-        WHERE s.id = %s 
-        AND s.user_id = (SELECT id FROM users WHERE auth0_id = %s)
-        GROUP BY s.id
-    """, (survey_id, auth0_id))
-    
-    result = db_cursor.fetchone()
-    if not result:
-        raise HTTPException(status_code=404, detail="Survey not found")
-        
-    return result
-
-def get_survey_results_summary(db_cursor, survey_id: int, auth0_id: str):
-    """Get summarized results for a survey"""
-    db_cursor.execute("""
-        SELECT 1 FROM surveys 
-        WHERE id = %s 
-        AND user_id = (SELECT id FROM users WHERE auth0_id = %s)
-    """, (survey_id, auth0_id))
-    
-    if not db_cursor.fetchone():
-        raise HTTPException(status_code=404, detail="Survey not found")
-    
-    db_cursor.execute("""
-        SELECT 
-            COUNT(*) as total_responses,
-            AVG(validation_score) as avg_validation_score,
-            json_build_object(
-                'responses', json_agg(response_data),
-                'demographics', json_agg(respondent_demographics)
-            ) as detailed_data
-        FROM results
-        WHERE survey_id = %s
-        GROUP BY survey_id
-    """, (survey_id,))
-    
-    return db_cursor.fetchone() or {
-        'total_responses': 0,
-        'avg_validation_score': 0,
-        'detailed_data': {'responses': [], 'demographics': []}
-    }
-
 # Database connection
 def get_db():
     conn = psycopg2.connect(**DB_PARAMS, cursor_factory=RealDictCursor)
@@ -231,13 +103,29 @@ def get_db():
     finally:
         conn.close()
 
-# Auth0 validation
+# JWT Token validation
 async def validate_token(credentials: HTTPAuthorizationCredentials = Security(security)):
     try:
         token = credentials.credentials
-        return await validate_auth0_token(token)
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        
+        if datetime.fromtimestamp(payload['exp']) < datetime.utcnow():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has expired"
+            )
+        
+        return payload
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials"
+        )
     except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials"
+        )
 
 # Initialize database tables
 def init_db():
@@ -406,7 +294,7 @@ async def add_to_waitlist(entry: WaitlistEntry):
 async def purchase_tokens(
     purchase: TokenPurchase,
     db = Depends(get_db),
-    user = Depends(verify_token)
+    user = Depends(validate_token)
 ):
     try:
         cur = db.cursor()
@@ -459,54 +347,59 @@ async def purchase_tokens(
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/audiences")
-async def list_audiences(
-    db = Depends(get_db),
-    user = Depends(verify_token)
-):
-    cur = db.cursor()
-    cur.execute("""
-        SELECT * 
-        FROM audiences
-        WHERE user_id = (SELECT id FROM users WHERE auth0_id = %s)
-    """, (user['sub'],))
-    return cur.fetchall()
-
 # Audience Management Endpoints
 @app.post("/audiences")
 async def create_audience(
     audience: Audience,
     db = Depends(get_db),
-    user = Depends(verify_token)
+    user = Depends(validate_token)
 ):
     try:
         cur = db.cursor()
-        
-        # Convert demographics dict to JSON string
-        demographics_json = json.dumps(audience.demographics)
         
         # Create the audience configuration
         cur.execute("""
             INSERT INTO audiences (user_id, name, description, size, demographics)
             VALUES ((SELECT id FROM users WHERE auth0_id = %s), %s, %s, %s, %s)
             RETURNING id
-        """, (user['sub'], audience.name, audience.description, audience.size, audience.demographics))
+        """, (user['sub'], audience.name, audience.description, audience.size, Json(audience.demographics)))
         
         audience_id = cur.fetchone()['id']
         
         # Sample people from ipumps table based on demographics
-        cur.execute("""
+        conditions = []
+        params = []
+        if 'age' in audience.demographics:
+            age_range = audience.demographics['age'].split('-')
+            if len(age_range) == 2:
+                conditions.append('"AGE" >= %s AND "AGE" <= %s')
+                params.extend([int(age_range[0]), int(age_range[1])])
+
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        
+        # Build the sampling query
+        sampling_query = f"""
             WITH sampled_people AS (
-                SELECT id, demographics
+                SELECT "SERIAL" as id, 
+                       jsonb_build_object(
+                           'age', "AGE"::text,
+                           'gender', "SEX",
+                           'education', "EDUC",
+                           'income', "INCTOT"::text
+                       ) as demographics
                 FROM ipumps
-                WHERE demographics @> %s
+                WHERE {where_clause}
                 ORDER BY RANDOM()
                 LIMIT %s
             )
             INSERT INTO audience_members (audience_id, user_id, ipump_id, demographics)
             SELECT %s, (SELECT id FROM users WHERE auth0_id = %s), id, demographics
             FROM sampled_people
-        """, (audience.demographics, audience.size, audience_id, user['sub']))
+        """
+        
+        # Add size and other parameters
+        params.extend([audience.size, audience_id, user['sub']])
+        cur.execute(sampling_query, params)
         
         db.commit()
         return {"id": audience_id}
@@ -558,7 +451,7 @@ async def create_question(
             VALUES ((SELECT id FROM users WHERE auth0_id = %s), %s, %s, %s, %s)
             RETURNING id
         """, (user['sub'], question.title, question.description, 
-              question.question_type, question.options))
+              question.question_type, Json(question.options) if question.options else None))
         db.commit()
         result = cur.fetchone()
         return {"id": result['id']}
@@ -569,7 +462,7 @@ async def create_question(
 @app.get("/questions")
 async def list_questions(
     db = Depends(get_db),
-    user = Depends(verify_token)
+    user = Depends(validate_token)
 ):
     cur = db.cursor()
     cur.execute("""
@@ -583,7 +476,7 @@ async def list_questions(
 async def create_survey(
     survey: Survey,
     db = Depends(get_db),
-    user = Depends(verify_token)
+    user = Depends(validate_token)
 ):
     try:
         cur = db.cursor()
@@ -623,7 +516,7 @@ async def create_survey(
 @app.get("/surveys")
 async def list_surveys(
     db = Depends(get_db),
-    user = Depends(verify_token)
+    user = Depends(validate_token)
 ):
     cur = db.cursor()
     cur.execute("""
@@ -641,7 +534,7 @@ async def add_question_to_survey(
     survey_id: int,
     question: SurveyQuestionUpdate,
     db = Depends(get_db),
-    user = Depends(verify_token)
+    user = Depends(validate_token)
 ):
     try:
         cur = db.cursor()
@@ -676,7 +569,7 @@ async def remove_question_from_survey(
     survey_id: int,
     question_id: int,
     db = Depends(get_db),
-    user = Depends(verify_token)
+    user = Depends(validate_token)
 ):
     try:
         cur = db.cursor()
@@ -709,7 +602,7 @@ async def remove_question_from_survey(
 async def get_survey_results(
     survey_id: int,
     db = Depends(get_db),
-    user = Depends(verify_token)
+    user = Depends(validate_token)
 ):
     cur = db.cursor()
     # Verify survey ownership
@@ -733,4 +626,3 @@ async def get_survey_results(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
