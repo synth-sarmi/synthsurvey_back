@@ -1,15 +1,15 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict
-from fastapi import FastAPI, Depends, HTTPException, Security
+from fastapi import FastAPI, Depends, HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, constr
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 import jwt
-import httpx
-from functools import lru_cache
+import bcrypt
+from uuid import uuid4
 from dotenv import load_dotenv
 import random
 import requests
@@ -18,6 +18,11 @@ import json
 
 # Load environment variables
 load_dotenv()
+
+# JWT Configuration
+JWT_SECRET = os.getenv('JWT_SECRET', str(uuid4()))
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24
 
 app = FastAPI(title="SynthSurvey API")
 
@@ -42,7 +47,7 @@ app.add_middleware(
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],  # Updated to allow Authorization header
+    allow_headers=["*"],
     expose_headers=["*"]
 )
 
@@ -55,6 +60,7 @@ DB_PARAMS = {
     "password": os.getenv("DB_PASSWORD")
 }
 
+# Models
 class WaitlistEntry(BaseModel):
     email: EmailStr
 
@@ -62,17 +68,19 @@ class TokenPurchase(BaseModel):
     amount: int
     payment_id: str
 
+from typing import Dict, Any
+
 class Audience(BaseModel):
     name: str
     description: Optional[str]
     size: int
-    demographics: dict
+    demographics: Dict[str, Any]
 
 class Question(BaseModel):
     title: str
     description: Optional[str]
     question_type: str
-    options: Optional[dict]
+    options: Optional[Dict[str, Any]]
 
 class Survey(BaseModel):
     title: str
@@ -85,74 +93,39 @@ class SurveyQuestionUpdate(BaseModel):
     question_id: int
     order_number: int
 
-# Auth0 Configuration
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "dev-16iksas57tijkr38.us.auth0.com")
-AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "api.synthsurvey.com/")
-
-def verify_token(token: str = Depends(security)) -> Dict:
-    try:
-        jwks_url = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
-        
-        # Fetch JWKS
-        response = requests.get(jwks_url)
-        response.raise_for_status()
-        jwks = response.json()
-
-        # Decode header to get key ID
-        unverified_header = jwt.get_unverified_header(token.credentials)
-        rsa_key = next(
-            (key for key in jwks["keys"] if key["kid"] == unverified_header["kid"]),
-            None
-        )
-
-        if not rsa_key:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid authentication credentials"
-            )
-
-        # Construct the public key
-        public_key = {
-            "kty": rsa_key["kty"],
-            "kid": rsa_key["kid"],
-            "use": rsa_key["use"],
-            "n": rsa_key["n"],
-            "e": rsa_key["e"]
-        }
-
-        # Verify and decode the token
-        payload = jwt.decode(
-            token.credentials,
-            key=jwt.algorithms.RSAAlgorithm.from_jwk(public_key),
-            algorithms=["RS256"],
-            audience=AUTH0_AUDIENCE,
-            issuer=f"https://{AUTH0_DOMAIN}/"
-        )
-
-        return payload
-
-    except ExpiredSignatureError:
-        raise HTTPException(
-            status_code=401,
-            detail="Token has expired"
-        )
-    except InvalidTokenError:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid claims. Please check the audience and issuer"
-        )
-    except PyJWTError:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication credentials"
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Unable to parse authentication token: {str(e)}"
-        )
-
 # Utility Functions
+@lru_cache()
+async def get_auth0_public_key():
+    """Fetch and cache Auth0 public key for token validation"""
+    try:
+        auth0_domain = os.getenv('AUTH0_DOMAIN')
+        url = f'https://{auth0_domain}/.well-known/jwks.json'
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+            return response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Auth0 public key: {str(e)}")
+
+async def validate_auth0_token(token: str) -> Dict:
+    """
+    Validate Auth0 JWT token and return payload
+    In production, implement full JWT validation using Auth0's JWKS
+    """
+    try:
+        # Decode token without verification for development
+        # In production, implement proper verification using Auth0's public key
+        payload = jwt.decode(
+            token,
+            options={"verify_signature": False}
+        )
+        
+        if 'sub' not in payload:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+            
+        return payload
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
 def check_user_tokens(db_cursor, auth0_id: str, required_tokens: int) -> bool:
     """Check if user has sufficient tokens"""
     db_cursor.execute("""
@@ -258,6 +231,14 @@ def get_db():
     finally:
         conn.close()
 
+# Auth0 validation
+async def validate_token(credentials: HTTPAuthorizationCredentials = Security(security)):
+    try:
+        token = credentials.credentials
+        return await validate_auth0_token(token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+
 # Initialize database tables
 def init_db():
     conn = psycopg2.connect(**DB_PARAMS)
@@ -280,6 +261,114 @@ def init_db():
 @app.on_event("startup")
 async def startup_event():
     init_db()
+
+# Auth Endpoints
+@app.post("/auth/signup")
+async def signup(user: UserSignup, db = Depends(get_db)):
+    try:
+        cur = db.cursor()
+        
+        # Check if email already exists
+        cur.execute("SELECT 1 FROM users WHERE email = %s", (user.email,))
+        if cur.fetchone():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+        
+        # Hash password
+        salt = bcrypt.gensalt()
+        hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), salt)
+        
+        # Generate user_id
+        user_id = str(uuid4())
+        
+        # Create user
+        cur.execute("""
+            INSERT INTO users (auth0_id, email, password_hash)
+            VALUES (%s, %s, %s)
+            RETURNING id, email
+        """, (user_id, user.email, hashed_password.decode('utf-8')))
+        
+        db.commit()
+        new_user = cur.fetchone()
+        
+        # Generate JWT token
+        token_expires = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+        token_payload = {
+            "sub": user_id,
+            "email": user.email,
+            "exp": token_expires.timestamp()
+        }
+        token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": JWT_EXPIRATION_HOURS * 3600
+        }
+        
+    except HTTPException as e:
+        db.rollback()
+        raise e
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+@app.post("/auth/login")
+async def login(user: UserLogin, db = Depends(get_db)):
+    try:
+        cur = db.cursor()
+        
+        # Get user
+        cur.execute("""
+            SELECT auth0_id, email, password_hash 
+            FROM users 
+            WHERE email = %s
+        """, (user.email,))
+        
+        db_user = cur.fetchone()
+        if not db_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials"
+            )
+        
+        # Verify password
+        if not bcrypt.checkpw(
+            user.password.encode('utf-8'), 
+            db_user['password_hash'].encode('utf-8')
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials"
+            )
+        
+        # Generate JWT token
+        token_expires = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+        token_payload = {
+            "sub": db_user['auth0_id'],  # We're reusing auth0_id field as our user_id
+            "email": db_user['email'],
+            "exp": token_expires.timestamp()
+        }
+        token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": JWT_EXPIRATION_HOURS * 3600
+        }
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
 # Waitlist Endpoint
 @app.post("/waitlist")
@@ -321,24 +410,51 @@ async def purchase_tokens(
 ):
     try:
         cur = db.cursor()
+        print(f"Processing token purchase for user {user['sub']}")
         
+        # Get user ID first
+        cur.execute("""
+            SELECT id, tokens_remaining 
+            FROM users 
+            WHERE auth0_id = %s
+        """, (user['sub'],))
+        
+        user_data = cur.fetchone()
+        print(f"Found user data: {user_data}")
+        
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+            
         # Add tokens to user's balance
         cur.execute("""
             UPDATE users 
             SET tokens_remaining = tokens_remaining + %s 
-            WHERE auth0_id = %s 
-            RETURNING tokens_remaining
-        """, (purchase.amount, user['sub']))
+            WHERE id = %s 
+            RETURNING id, tokens_remaining
+        """, (purchase.amount, user_data['id']))
+        
+        update_result = cur.fetchone()
+        print(f"Update result: {update_result}")
+        
+        if not update_result:
+            raise HTTPException(status_code=500, detail="Failed to update token balance")
         
         # Record the transaction
         cur.execute("""
             INSERT INTO tokens (user_id, amount, transaction_type, description)
-            VALUES ((SELECT id FROM users WHERE auth0_id = %s), %s, 'purchase', %s)
-        """, (user['sub'], purchase.amount, f"Token purchase: {purchase.payment_id}"))
+            VALUES (%s, %s, 'purchase', %s)
+            RETURNING id
+        """, (user_data['id'], purchase.amount, f"Token purchase: {purchase.payment_id}"))
+        
+        transaction_result = cur.fetchone()
+        print(f"Transaction result: {transaction_result}")
         
         db.commit()
-        result = cur.fetchone()
-        return {"success": True, "new_balance": result['tokens_remaining']}
+        return {
+            "success": True, 
+            "new_balance": update_result['tokens_remaining'],
+            "transaction_id": transaction_result['id']
+        }
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -374,8 +490,75 @@ async def create_audience(
             INSERT INTO audiences (user_id, name, description, size, demographics)
             VALUES ((SELECT id FROM users WHERE auth0_id = %s), %s, %s, %s, %s)
             RETURNING id
-        """, (user['sub'], audience.name, audience.description, audience.size, demographics_json))
+        """, (user['sub'], audience.name, audience.description, audience.size, audience.demographics))
         
+        audience_id = cur.fetchone()['id']
+        
+        # Sample people from ipumps table based on demographics
+        cur.execute("""
+            WITH sampled_people AS (
+                SELECT id, demographics
+                FROM ipumps
+                WHERE demographics @> %s
+                ORDER BY RANDOM()
+                LIMIT %s
+            )
+            INSERT INTO audience_members (audience_id, user_id, ipump_id, demographics)
+            SELECT %s, (SELECT id FROM users WHERE auth0_id = %s), id, demographics
+            FROM sampled_people
+        """, (audience.demographics, audience.size, audience_id, user['sub']))
+        
+        db.commit()
+        return {"id": audience_id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/audiences")
+async def list_audiences(
+    db = Depends(get_db),
+    user = Depends(validate_token)
+):
+    cur = db.cursor()
+    cur.execute("""
+        SELECT a.*, COUNT(am.id) as current_size 
+        FROM audiences a
+        LEFT JOIN audience_members am ON a.id = am.audience_id
+        WHERE a.user_id = (SELECT id FROM users WHERE auth0_id = %s)
+        GROUP BY a.id
+    """, (user['sub'],))
+    return cur.fetchall()
+
+@app.get("/audiences/{audience_id}/members")
+async def get_audience_members(
+    audience_id: int,
+    db = Depends(get_db),
+    user = Depends(validate_token)
+):
+    cur = db.cursor()
+    cur.execute("""
+        SELECT am.* 
+        FROM audience_members am
+        WHERE am.audience_id = %s 
+        AND am.user_id = (SELECT id FROM users WHERE auth0_id = %s)
+    """, (audience_id, user['sub']))
+    return cur.fetchall()
+
+# Question Management Endpoints
+@app.post("/questions")
+async def create_question(
+    question: Question,
+    db = Depends(get_db),
+    user = Depends(validate_token)
+):
+    try:
+        cur = db.cursor()
+        cur.execute("""
+            INSERT INTO questions (user_id, title, description, question_type, options)
+            VALUES ((SELECT id FROM users WHERE auth0_id = %s), %s, %s, %s, %s)
+            RETURNING id
+        """, (user['sub'], question.title, question.description, 
+              question.question_type, question.options))
         db.commit()
         result = cur.fetchone()
         return {"id": result['id']}

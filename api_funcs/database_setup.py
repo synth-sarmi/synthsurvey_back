@@ -5,11 +5,12 @@ from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 # SQL script to create the database structure
 CREATE_TABLES = """
--- Users table to store additional user info beyond Auth0
+-- Users table
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
-    auth0_id VARCHAR(128) UNIQUE NOT NULL,
-    email VARCHAR(255) NOT NULL,
+    auth0_id VARCHAR(128) UNIQUE NOT NULL,  -- Keeping this for backward compatibility, will use as our user_id
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     tokens_remaining INTEGER DEFAULT 0,
     subscription_tier VARCHAR(50) DEFAULT 'free'

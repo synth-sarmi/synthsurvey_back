@@ -1,18 +1,25 @@
-from fastapi import FastAPI, Depends, HTTPException, Security
+from fastapi import FastAPI, Depends, HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import jwt
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, constr
 import random
+import bcrypt
+from uuid import uuid4
 
 # Load environment variables
 load_dotenv()
+
+# JWT Configuration
+JWT_SECRET = os.getenv('JWT_SECRET', str(uuid4()))  # Generate a random secret if not provided
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24
 
 app = FastAPI(title="SynthSurvey API")
 
@@ -43,23 +50,146 @@ def get_db():
     finally:
         conn.close()
 
-# Auth0 validation
+# JWT Token validation
 async def validate_token(credentials: HTTPAuthorizationCredentials = Security(security)):
     try:
         token = credentials.credentials
-        jwks_url = f'https://{os.getenv("AUTH0_DOMAIN")}/.well-known/jwks.json'
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         
-        # Validate token with Auth0
-        # In production, implement proper JWT validation using Auth0's JWKS
-        # This is a simplified version
-        payload = jwt.decode(
-            token,
-            options={"verify_signature": False}  # Remove in production
-        )
+        if datetime.fromtimestamp(payload['exp']) < datetime.utcnow():
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has expired"
+            )
         
         return payload
+    except jwt.JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials"
+        )
     except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials"
+        )
+
+# Auth Models
+class UserSignup(BaseModel):
+    email: EmailStr
+    password: constr(min_length=8)
+    
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+# Auth Endpoints
+@app.post("/auth/signup")
+async def signup(user: UserSignup, db = Depends(get_db)):
+    try:
+        cur = db.cursor()
+        
+        # Check if email already exists
+        cur.execute("SELECT 1 FROM users WHERE email = %s", (user.email,))
+        if cur.fetchone():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+        
+        # Hash password
+        salt = bcrypt.gensalt()
+        hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), salt)
+        
+        # Generate user_id
+        user_id = str(uuid4())
+        
+        # Create user
+        cur.execute("""
+            INSERT INTO users (auth0_id, email, password_hash)
+            VALUES (%s, %s, %s)
+            RETURNING id, email
+        """, (user_id, user.email, hashed_password.decode('utf-8')))
+        
+        db.commit()
+        new_user = cur.fetchone()
+        
+        # Generate JWT token
+        token_expires = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+        token_payload = {
+            "sub": user_id,
+            "email": user.email,
+            "exp": token_expires.timestamp()
+        }
+        token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": JWT_EXPIRATION_HOURS * 3600
+        }
+        
+    except HTTPException as e:
+        db.rollback()
+        raise e
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+@app.post("/auth/login")
+async def login(user: UserLogin, db = Depends(get_db)):
+    try:
+        cur = db.cursor()
+        
+        # Get user
+        cur.execute("""
+            SELECT auth0_id, email, password_hash 
+            FROM users 
+            WHERE email = %s
+        """, (user.email,))
+        
+        db_user = cur.fetchone()
+        if not db_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials"
+            )
+        
+        # Verify password
+        if not bcrypt.checkpw(
+            user.password.encode('utf-8'), 
+            db_user['password_hash'].encode('utf-8')
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials"
+            )
+        
+        # Generate JWT token
+        token_expires = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+        token_payload = {
+            "sub": db_user['auth0_id'],  # We're reusing auth0_id field as our user_id
+            "email": db_user['email'],
+            "exp": token_expires.timestamp()
+        }
+        token = jwt.encode(token_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": JWT_EXPIRATION_HOURS * 3600
+        }
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
 # Models
 class TokenPurchase(BaseModel):
