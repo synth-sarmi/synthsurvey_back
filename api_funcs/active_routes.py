@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr, constr
+from pydantic import BaseModel, EmailStr, constr, HttpUrl
 import jwt
 import bcrypt
 from datetime import datetime, timedelta
@@ -35,6 +35,22 @@ class Audience(BaseModel):
     description: Optional[str]
     size: int
     demographics: Dict[str, Any]
+
+class SurveyCreate(BaseModel):
+    audience_id: int
+    url: HttpUrl
+    url_type: str
+
+class SurveyResponse(BaseModel):
+    id: int
+    audience_id: int
+    url: str
+    url_type: str
+    status: str
+    responses_generated: int
+    total_responses: int
+    created_at: datetime
+    updated_at: datetime
 
 # Database connection parameters from environment
 DB_PARAMS = {
@@ -255,3 +271,68 @@ async def list_audiences(
         GROUP BY a.id
     """, (user['sub'],))
     return cur.fetchall()
+
+@router.post("/surveys", response_model=SurveyResponse)
+async def create_survey(
+    survey: SurveyCreate,
+    db = Depends(get_db),
+    user = Depends(validate_token)
+):
+    try:
+        cur = db.cursor()
+        
+        # Verify the audience belongs to the user
+        cur.execute("""
+            SELECT size FROM audiences 
+            WHERE id = %s AND user_id = (SELECT id FROM users WHERE auth0_id = %s)
+        """, (survey.audience_id, user['sub']))
+        
+        audience = cur.fetchone()
+        if not audience:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Audience not found or doesn't belong to user"
+            )
+        
+        # Create the survey
+        cur.execute("""
+            INSERT INTO surveys 
+            (user_id, audience_id, url, url_type, total_responses)
+            VALUES (
+                (SELECT id FROM users WHERE auth0_id = %s),
+                %s, %s, %s, %s
+            )
+            RETURNING *
+        """, (
+            user['sub'],
+            survey.audience_id,
+            str(survey.url),
+            survey.url_type,
+            audience['size']
+        ))
+        
+        new_survey = cur.fetchone()
+        db.commit()
+        return new_survey
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/surveys", response_model=list[SurveyResponse])
+async def list_surveys(
+    db = Depends(get_db),
+    user = Depends(validate_token)
+):
+    try:
+        cur = db.cursor()
+        cur.execute("""
+            SELECT s.*, a.size as audience_size
+            FROM surveys s
+            JOIN audiences a ON s.audience_id = a.id
+            WHERE s.user_id = (SELECT id FROM users WHERE auth0_id = %s)
+            ORDER BY s.created_at DESC
+        """, (user['sub'],))
+        return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
