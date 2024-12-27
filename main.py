@@ -13,15 +13,7 @@ app = FastAPI(title="SynthSurvey API")
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://synthsurvey.com",
-        "https://synthsurvey.com",
-        "http://www.synthsurvey.com",
-        "https://www.synthsurvey.com",
-        "http://localhost:3000",  # For local development
-        "http://localhost:5000",  # For local development
-        "http://localhost:4173"   # For local development
-    ],
+    allow_origins=["*"],  # Allow all origins during development
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -40,6 +32,17 @@ def init_db():
     conn = psycopg2.connect(**DB_PARAMS)
     cur = conn.cursor()
     try:
+        # Create updated_at trigger function if it doesn't exist
+        cur.execute("""
+            CREATE OR REPLACE FUNCTION update_updated_at_column()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.updated_at = CURRENT_TIMESTAMP;
+                RETURN NEW;
+            END;
+            $$ language 'plpgsql';
+        """)
+
         # Create waitlist table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS waitlist (
@@ -47,6 +50,42 @@ def init_db():
                 email VARCHAR(255) UNIQUE NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+        """)
+
+        # Create users table if it doesn't exist
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                auth0_id VARCHAR(255) UNIQUE NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        # Create audiences table with unique name constraint
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audiences (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                name VARCHAR(255) NOT NULL,
+                description TEXT,
+                size INTEGER NOT NULL,
+                demographics JSONB,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, name)
+            );
+        """)
+
+        # Create trigger for audiences updated_at
+        cur.execute("""
+            DROP TRIGGER IF EXISTS update_audiences_updated_at ON audiences;
+            CREATE TRIGGER update_audiences_updated_at
+                BEFORE UPDATE ON audiences
+                FOR EACH ROW
+                EXECUTE FUNCTION update_updated_at_column();
         """)
         conn.commit()
     finally:
